@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+
+# Local/generated datasets and features
+mel_dataset/
+mel_dataset_smoke/
+detected_cycles/
+*.wav
+*.npy
+
+# Trained model artifacts
+models/
+*.pt
+*.pth
+
+# Generated plots and logs
+plots/
+run_logs/
+*.log
+
+# Local environment files
+.env
+.venv/
+venv/
