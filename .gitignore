@@ -8,6 +8,12 @@ detected_cycles/
 *.wav
 *.npy
 
+# Small demo outputs kept in the repository
+!mel_dataset_smoke/
+!mel_dataset_smoke/manifest.csv
+!mel_dataset_smoke/features/
+!mel_dataset_smoke/features/*.npy
+
 # Trained model artifacts
 models/
 *.pt
@@ -17,6 +23,9 @@ models/
 plots/
 run_logs/
 *.log
+
+!plots/
+!plots/*.png
 
 # Local environment files
 .env
