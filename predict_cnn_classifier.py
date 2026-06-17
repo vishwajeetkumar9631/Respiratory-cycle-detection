@@ -6,21 +6,27 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from train_cnn_classifier import CompactRespiratoryCNN
+from train_cnn_classifier import create_model
 
 
 def predict(model_path: Path, feature_path: Path, cpu: bool = False) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and not cpu else "cpu")
     checkpoint = torch.load(model_path, map_location=device)
     class_names = checkpoint.get("class_names", ["healthy", "diseased"])
+    architecture = checkpoint.get("architecture", "paper")
+    input_channels = int(checkpoint.get("input_channels", checkpoint.get("input_shape", [1])[0]))
     diseased_threshold = float(checkpoint.get("diseased_threshold", 0.5))
 
-    model = CompactRespiratoryCNN(num_classes=len(class_names)).to(device)
+    model = create_model(architecture, num_classes=len(class_names), input_channels=input_channels).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
-    feature = np.load(feature_path).astype(np.float32)
-    tensor = torch.from_numpy(feature).unsqueeze(0).unsqueeze(0).to(device)
+    feature = np.ascontiguousarray(np.load(feature_path), dtype=np.float32)
+    if feature.ndim == 2:
+        feature = feature[np.newaxis, :, :]
+    elif feature.ndim != 3:
+        raise ValueError(f"Expected 2D or 3D feature tensor, got shape {feature.shape}")
+    tensor = torch.from_numpy(feature).unsqueeze(0).to(device)
     with torch.no_grad():
         logits = model(tensor)
         probabilities = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
