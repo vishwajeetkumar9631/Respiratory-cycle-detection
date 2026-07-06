@@ -3,6 +3,33 @@ __pycache__/
 
 # Local/generated datasets and features
 mel_dataset/
+hf_subject_independent_dataset/
+hybrid_dataset/
+hybrid_dataset_split/
+icbhi_opensmile_stacking_dataset/
+icbhi_preprocessed/
+icbhi_preprocessed_opensmile_1s_dataset/
+icbhi_preprocessed_opensmile_stacking_dataset/
+kauh_hf_paper_calibrated_dataset/
+kauh_hf_paper_dataset/
+kauh_hf_study_dataset/
+kauh_hf_study_dataset_bandlimited/
+kauh_hf_study_dataset_v2/
+kauh_hf_study_dataset_v3/
+kauh_mel_dataset/
+kauh_preprocessed/
+mel_dataset_kfold/
+mel_dataset_kfold_filtered/
+mel_dataset_paper/
+mel_dataset_paper_split/
+mel_dataset_split/
+mel_dataset_v2/
+mel_dataset_v2_split/
+mfcc_dataset/
+mfcc_dataset_split/
+mfcc_large_dataset/
+mfcc_large_dataset_split/
+opensmile_stacking_dataset/
 mel_dataset_smoke/
 detected_cycles/
 *.wav
@@ -26,6 +53,7 @@ run_logs/
 
 !plots/
 !plots/*.png
+plots/*/
 
 # Local environment files
 .env

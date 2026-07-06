@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage
 from scipy import signal
+from scipy.fft import dct
 
 from segment_icbhi_cycles import (
     DEFAULT_DATASET,
@@ -124,7 +125,7 @@ def log_mel_spectrogram(
     audio: np.ndarray,
     sample_rate: int,
     n_mels: int,
-    n_frames: int,
+    n_frames: int | None,
     n_fft: int,
     hop_length: int,
     f_min: float,
@@ -150,9 +151,92 @@ def log_mel_spectrogram(
     filters = mel_filterbank(sample_rate, n_fft, n_mels, f_min, f_max, vtlp_alpha)
     mel_power = filters @ power
     log_mel = 10.0 * np.log10(np.maximum(mel_power, 1e-10))
-    log_mel = resize_time_axis(log_mel, n_frames)
+    if n_frames is not None:
+        log_mel = resize_time_axis(log_mel, n_frames)
     log_mel = smooth_log_mel(log_mel, smooth_freq_sigma, smooth_time_sigma)
     return zscore(log_mel).astype(np.float32)
+
+
+def mfcc_feature(
+    audio: np.ndarray,
+    sample_rate: int,
+    n_mfcc: int,
+    n_frames: int,
+    n_fft: int,
+    hop_length: int,
+    f_min: float,
+    f_max: float,
+    vtlp_alpha: float = 1.0,
+    smooth_coeff_sigma: float = 0.4,
+    smooth_time_sigma: float = 0.6,
+) -> np.ndarray:
+    if audio.size < n_fft:
+        audio = np.pad(audio, (0, n_fft - audio.size))
+
+    _, _, stft = signal.stft(
+        audio,
+        fs=sample_rate,
+        window="hann",
+        nperseg=n_fft,
+        noverlap=max(n_fft - hop_length, 0),
+        nfft=n_fft,
+        boundary="zeros",
+        padded=True,
+    )
+    power = np.abs(stft) ** 2
+    filters = mel_filterbank(sample_rate, n_fft, max(n_mfcc * 2, 40), f_min, f_max, vtlp_alpha)
+    mel_power = filters @ power
+    log_mel = np.log(np.maximum(mel_power, 1e-10))
+    mfcc = dct(log_mel, type=2, axis=0, norm="ortho")[:n_mfcc]
+    mfcc = resize_time_axis(mfcc, n_frames)
+    mfcc = smooth_log_mel(mfcc, smooth_coeff_sigma, smooth_time_sigma)
+    return zscore(mfcc).astype(np.float32)
+
+
+def cycle_feature(
+    audio: np.ndarray,
+    sample_rate: int,
+    n_mels: int,
+    n_frames: int,
+    n_fft: int,
+    hop_length: int,
+    f_min: float,
+    f_max: float,
+    vtlp_alpha: float,
+    smooth_freq_sigma: float,
+    smooth_time_sigma: float,
+    feature_kind: str,
+) -> np.ndarray:
+    mel = log_mel_spectrogram(
+        audio,
+        sample_rate,
+        n_mels,
+        n_frames,
+        n_fft,
+        hop_length,
+        f_min,
+        f_max,
+        vtlp_alpha,
+        smooth_freq_sigma,
+        smooth_time_sigma,
+    )
+    if feature_kind == "mel":
+        return mel
+    if feature_kind == "mfcc":
+        return mfcc_feature(
+            audio,
+            sample_rate,
+            n_mels,
+            n_frames,
+            n_fft,
+            hop_length,
+            f_min,
+            f_max,
+            vtlp_alpha,
+            smooth_freq_sigma,
+            smooth_time_sigma,
+        )
+    raise ValueError(f"Unknown feature kind: {feature_kind}")
 
 
 def read_cycle_rows(path: Path) -> list[tuple[float, float, int, int]]:
@@ -231,6 +315,7 @@ def build_mel_dataset(
     f_max: float,
     smooth_freq_sigma: float,
     smooth_time_sigma: float,
+    feature_kind: str,
     augment_vtlp: int,
     vtlp_min: float,
     vtlp_max: float,
@@ -238,17 +323,31 @@ def build_mel_dataset(
     overwrite: bool,
     manifest_only: bool,
     limit: int | None,
+    cycle_source: str,
+    min_cycle_duration: float,
+    max_cycle_duration: float | None,
 ) -> None:
     feature_dir = output_dir / "features"
     feature_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "manifest.csv"
     rng = np.random.default_rng(seed)
 
-    cycle_paths = sorted(cycles_dir.glob("*_detected_cycles.txt"))
+    if cycle_source == "annotations":
+        wav_paths = sorted(dataset_dir.glob("*.wav"))
+        recording_stems = [
+            path.stem
+            for path in wav_paths
+            if (annotation_dir / f"{path.stem}.txt").exists()
+        ]
+    else:
+        recording_stems = [
+            path.name.removesuffix("_detected_cycles.txt")
+            for path in sorted(cycles_dir.glob("*_detected_cycles.txt"))
+        ]
     if limit is not None:
-        cycle_paths = cycle_paths[:limit]
-    if not cycle_paths:
-        raise FileNotFoundError(f"No detected cycle files found in {cycles_dir}")
+        recording_stems = recording_stems[:limit]
+    if not recording_stems:
+        raise FileNotFoundError(f"No cycle sources found for mode {cycle_source}")
 
     fieldnames = [
         "feature_path",
@@ -270,8 +369,13 @@ def build_mel_dataset(
         "sample_rate",
         "n_mels",
         "n_frames",
+        "n_fft",
+        "hop_length",
+        "f_min",
+        "f_max",
         "smooth_freq_sigma",
         "smooth_time_sigma",
+        "feature_kind",
     ]
 
     total_features = 0
@@ -279,26 +383,37 @@ def build_mel_dataset(
         writer = csv.DictWriter(manifest_file, fieldnames=fieldnames)
         writer.writeheader()
 
-        for file_index, cycle_path in enumerate(cycle_paths, start=1):
-            recording_stem = cycle_path.name.removesuffix("_detected_cycles.txt")
+        for file_index, recording_stem in enumerate(recording_stems, start=1):
             wav_path = dataset_dir / f"{recording_stem}.wav"
             if not wav_path.exists():
-                print(f"[skip] Missing WAV for {cycle_path.name}: {wav_path}", flush=True)
+                print(f"[skip] Missing WAV: {wav_path}", flush=True)
                 continue
 
             input_rate, raw_audio = read_wav_mono(wav_path)
             processed = preprocess_audio(raw_audio, input_rate, target_rate)
-            cycles = read_cycle_rows(cycle_path)
             annotation_path = annotation_dir / f"{recording_stem}.txt"
             annotations = read_cycle_rows(annotation_path) if annotation_path.exists() else []
+            if cycle_source == "annotations":
+                cycles = annotations
+            else:
+                cycle_path = cycles_dir / f"{recording_stem}_detected_cycles.txt"
+                cycles = read_cycle_rows(cycle_path)
             recording = parse_icbhi_name(wav_path)
+            kept_cycles = 0
 
             for cycle_index, (start, end, crackle, wheeze) in enumerate(cycles, start=1):
-                crackle, wheeze = best_overlap_label(start, end, annotations, crackle, wheeze)
+                duration_s = end - start
+                if duration_s < min_cycle_duration:
+                    continue
+                if max_cycle_duration is not None and duration_s > max_cycle_duration:
+                    continue
+                if cycle_source != "annotations":
+                    crackle, wheeze = best_overlap_label(start, end, annotations, crackle, wheeze)
                 start_sample = max(int(round(start * target_rate)), 0)
                 end_sample = min(int(round(end * target_rate)), processed.size)
                 if end_sample <= start_sample:
                     continue
+                kept_cycles += 1
 
                 cycle_audio = processed[start_sample:end_sample]
                 alphas = [1.0]
@@ -310,7 +425,7 @@ def build_mel_dataset(
                     if manifest_only:
                         feature_path = feature_dir / out_name
                     else:
-                        feature = log_mel_spectrogram(
+                        feature = cycle_feature(
                             cycle_audio,
                             target_rate,
                             n_mels,
@@ -322,6 +437,7 @@ def build_mel_dataset(
                             alpha,
                             smooth_freq_sigma,
                             smooth_time_sigma,
+                            feature_kind,
                         )
                         feature_path = write_feature(feature_dir, out_name, feature, overwrite)
 
@@ -334,7 +450,7 @@ def build_mel_dataset(
                             "cycle_index": cycle_index,
                             "start_time_s": f"{start:.3f}",
                             "end_time_s": f"{end:.3f}",
-                            "duration_s": f"{end - start:.3f}",
+                            "duration_s": f"{duration_s:.3f}",
                             "crackle": crackle,
                             "wheeze": wheeze,
                             "class_name": class_name(crackle, wheeze),
@@ -343,16 +459,21 @@ def build_mel_dataset(
                             "sample_rate": target_rate,
                             "n_mels": n_mels,
                             "n_frames": n_frames,
+                            "n_fft": n_fft,
+                            "hop_length": hop_length,
+                            "f_min": f"{f_min:.1f}",
+                            "f_max": f"{f_max:.1f}",
                             "smooth_freq_sigma": f"{smooth_freq_sigma:.3f}",
                             "smooth_time_sigma": f"{smooth_time_sigma:.3f}",
+                            "feature_kind": feature_kind,
                         }
                     )
                     total_features += 1
 
             manifest_file.flush()
             print(
-                f"[{file_index}/{len(cycle_paths)}] {wav_path.name}: "
-                f"{len(cycles)} cycles",
+                f"[{file_index}/{len(recording_stems)}] {wav_path.name}: "
+                f"{kept_cycles}/{len(cycles)} cycles kept",
                 flush=True,
             )
 
@@ -378,6 +499,12 @@ def main() -> None:
         help="Directory containing *_detected_cycles.txt files.",
     )
     parser.add_argument(
+        "--cycle-source",
+        choices=["annotations", "detected"],
+        default="annotations",
+        help="Use official ICBHI annotated cycles by default; detected cycles are optional.",
+    )
+    parser.add_argument(
         "--annotation-dir",
         type=Path,
         default=None,
@@ -396,6 +523,8 @@ def main() -> None:
     parser.add_argument("--hop-length", type=int, default=128)
     parser.add_argument("--f-min", type=float, default=100.0)
     parser.add_argument("--f-max", type=float, default=2000.0)
+    parser.add_argument("--min-cycle-duration", type=float, default=0.35)
+    parser.add_argument("--max-cycle-duration", type=float, default=6.0)
     parser.add_argument(
         "--smooth-freq-sigma",
         type=float,
@@ -407,6 +536,12 @@ def main() -> None:
         type=float,
         default=0.8,
         help="Gaussian smoothing sigma across time frames. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--feature-kind",
+        choices=["mel", "mfcc"],
+        default="mel",
+        help="Feature representation to save: log-mel spectrogram or MFCC coefficient map.",
     )
     parser.add_argument(
         "--augment-vtlp",
@@ -430,6 +565,8 @@ def main() -> None:
         help="Optional number of recordings to process for a quick smoke test.",
     )
     args = parser.parse_args()
+    if args.max_cycle_duration is not None and args.max_cycle_duration <= 0:
+        args.max_cycle_duration = None
 
     build_mel_dataset(
         dataset_dir=args.dataset_dir,
@@ -445,6 +582,7 @@ def main() -> None:
         f_max=args.f_max,
         smooth_freq_sigma=args.smooth_freq_sigma,
         smooth_time_sigma=args.smooth_time_sigma,
+        feature_kind=args.feature_kind,
         augment_vtlp=args.augment_vtlp,
         vtlp_min=args.vtlp_min,
         vtlp_max=args.vtlp_max,
@@ -452,6 +590,9 @@ def main() -> None:
         overwrite=args.overwrite,
         manifest_only=args.manifest_only,
         limit=args.limit,
+        cycle_source=args.cycle_source,
+        min_cycle_duration=args.min_cycle_duration,
+        max_cycle_duration=args.max_cycle_duration,
     )
 
 
